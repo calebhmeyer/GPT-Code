@@ -1,0 +1,124 @@
+///////////////////////////////////////////////////////////////////////////////
+//  Beam Material Expression Custom Code
+//  – now supports independent four-sided shutters with per-blade angle
+///////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////
+//  EXISTING PARAMETERS (unchanged)  … NumGobos, ConeRadius, etc.
+///////////////////////////////////////////////////////////////////////////////
+// ---------------------------------------------------------------------------
+
+float traversalDepth = FDepth - NDepth;
+uint  numSteps       = floor(traversalDepth / StepSize);
+float3 posOffset     = normalize(FSlice - NSlice) * StepSize;
+
+float Adj = AdjOpp.x;
+float Opp = AdjOpp.y + ConeRadius;
+
+float ShutterSoftness = .05;
+float3 cumul = 0;
+
+//------------------ ANGLED SHUTTER PRE-COMPUTE (done once per pixel) --------
+float2 pivotLeft     = float2(FrameLeft,        0.5);
+float2 pivotRight    = float2(1.0 - FrameRight, 0.5);
+float2 pivotBottom   = float2(0.5,              FrameBottom);
+float2 pivotTop      = float2(0.5,              1.0 - FrameTop);
+
+float2 nLeft   = float2(-cos(radians(AngleLeft)),  -sin(radians(AngleLeft)));
+float2 nRight  = float2( cos(radians(AngleRight)),  sin(radians(AngleRight)));
+float2 nBottom = float2( sin(radians(AngleBottom)), -cos(radians(AngleBottom)));
+float2 nTop    = float2(-sin(radians(AngleTop)),     cos(radians(AngleTop)));
+//---------------------------------------------------------------------------
+
+///////////////////////////////////////////////////////////////////////////////
+//  MAIN RAY-MARCH LOOP
+///////////////////////////////////////////////////////////////////////////////
+for (uint i = 0; i < numSteps; ++i)
+{
+    //---------------------------- Geometry & fall-off ------------------------
+    float3 pos   = NSlice + posOffset * i;            // sample position
+    float  depth = NDepth  + StepSize  * i;           // along-beam distance
+
+    float dist    = length(pos);                      // radial distance
+    float falloff = 1.0f - (dist / MaxDistance);      // linear fade to zero
+
+    //---------------------------- Domain transform ---------------------------
+    pos.z  = -pos.z;                                  // flip for 2-D texture
+    pos   /= float3(Opp * 2, Opp * 2, Adj);           // scale to [-1 … 1]
+    float div = ConeRadius / Opp;                     // conical scaling
+          div = (pos.z * (1 - div)) + div;
+    pos.xy /= div;
+    pos.z  -= 0.5;                                    // centre in Z
+
+    //---------------------------- Soft clipping ------------------------------
+    float maskX = (1 - abs(pos.x)) > 0.5;
+    float maskY = (1 - abs(pos.y)) > 0.5;
+    float maskZ = (1 - abs(pos.z)) > 0.5;
+    if ((maskX * maskY * maskZ) - 0.5 < 0)  continue;
+
+    float dClip = saturate((ScDepth - depth) / SoftClipSize); // near/far fade
+
+    //---------------------------- Base UV ------------------------------------
+    float2 UVBase = saturate(pos.xy + 0.5);           // bring to [0 … 1]
+
+    ///////////////////////////////////////////////////////////////////////////
+    //  SHUTTER MASK  (soft-edged)
+    //  ------------------------------------------------
+    //  For each blade, compute signed distance "d":
+    //      d ≤ 0   → fully inside (light passes)
+    //      0 < d < ShutterSoftness → feathered fade
+    //      d ≥ ShutterSoftness     → fully blocked
+    ///////////////////////////////////////////////////////////////////////////
+    float dLeft   = dot(nLeft,   UVBase - pivotLeft );
+    float dRight  = dot(nRight,  UVBase - pivotRight);
+    float dBottom = dot(nBottom, UVBase - pivotBottom);
+    float dTop    = dot(nTop,    UVBase - pivotTop  );
+
+    float leftMask   = 1.0 - smoothstep(0.0, ShutterSoftness, dLeft  );
+    float rightMask  = 1.0 - smoothstep(0.0, ShutterSoftness, dRight );
+    float bottomMask = 1.0 - smoothstep(0.0, ShutterSoftness, dBottom);
+    float topMask    = 1.0 - smoothstep(0.0, ShutterSoftness, dTop   );
+
+    float shutterMask = leftMask * rightMask * bottomMask * topMask; // 1=open
+
+    //------------------------ GOBO  #1 ---------------------------------------
+    float2 GoboUV1 = UVBase;
+    GoboUV1.x  = (GoboUV1.x / NumGobos) + (GoboIndex  / NumGobos);
+    GoboUV1.x +=  Time * GoboScrollingSpeed;
+    float GoboSample1 = TXTpGobo.SampleLevel(TXTpGoboSampler, GoboUV1, Level).x;
+
+    //------------------------ GOBO  #2 ---------------------------------------
+    float2 GoboUV2 = UVBase;
+    GoboUV2.x  = (GoboUV2.x / NumGobos2) + (GoboIndex2 / NumGobos2);
+    GoboUV2.x +=  Time * GoboScrollingSpeed;
+    float GoboSample2 = TXTpGobo2.SampleLevel(TXTpGobo2Sampler, GoboUV2, Level).x;
+
+    //------------------------ GOBO  #3 ---------------------------------------
+    float2 GoboUV3 = UVBase;
+    GoboUV3.x  = (GoboUV3.x / NumGobos3) + (GoboIndex3 / NumGobos3);
+    GoboUV3.x +=  Time * GoboScrollingSpeed;
+    float GoboSample3 = TXTpGobo3.SampleLevel(TXTpGobo3Sampler, GoboUV3, Level).x;
+
+    float GoboSample = GoboSample1 * GoboSample2 * GoboSample3;
+
+    //------------------------ COLOR WHEEL & DMX ------------------------------
+    float2 ColorUV = UVBase;
+    ColorUV.x  = (ColorUV.x / NumColors) + (ColorIndex / NumColors);
+    ColorUV.x += (Time - CurrentTime) * ColorScrollingSpeed;
+    float3 ColorSample = TXTpColor.SampleLevel(TXTpColorSampler, ColorUV, 0) * DMXColor;
+
+    //------------------------ Inverse-square & accumulate --------------------
+    float invsqr = 1.0f / (dist * dist);
+
+    cumul += (1.0f / numSteps) *
+             GoboSample * ColorSample *
+             shutterMask *              // ← soft-edged attenuation
+             dClip * invsqr * falloff;
+}
+
+//---------------------------------------------------------------------------
+//  FINAL OUTPUT
+//---------------------------------------------------------------------------
+//  'cumul' already incorporates gobo, colour, inverse-square decay,
+//  depth fade, and the new soft-edged shutter masking.
+return cumul;
